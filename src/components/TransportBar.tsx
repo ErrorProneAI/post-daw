@@ -2,8 +2,6 @@ import { useEffect } from "react";
 import { useProjectStore } from "../store/projectStore";
 import { AudioEngine } from "../audio/AudioEngine";
 import { formatTime } from "../utils/format";
-import { renderProject } from "../audio/Renderer";
-import { encodeWav } from "../utils/wav";
 
 interface Props {
   engine: AudioEngine;
@@ -18,52 +16,83 @@ export function TransportBar({ engine }: Props) {
   const setProjectName = useProjectStore((s) => s.setProjectName);
   const undo = useProjectStore((s) => s.undo);
   const redo = useProjectStore((s) => s.redo);
-  const setExportState = useProjectStore((s) => s.setExportState);
   const exportInProgress = useProjectStore((s) => s.export.inProgress);
+  const setShowExportModal = useProjectStore((s) => s.setShowExportModal);
+  const setShowShortcuts = useProjectStore((s) => s.setShowShortcuts);
+  const setShowAssistant = useProjectStore((s) => s.setShowAssistant);
+  const removeClip = useProjectStore((s) => s.removeClip);
+  const splitClip = useProjectStore((s) => s.splitClip);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.target && (e.target as HTMLElement).tagName === "INPUT") return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName ?? "";
+      const isEditable =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        target?.isContentEditable === true;
+      if (isEditable) return;
+      const meta = e.ctrlKey || e.metaKey;
+
       if (e.code === "Space") {
         e.preventDefault();
-        playing ? engine.pause() : engine.play();
-      } else if (e.key === "z" && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+        if (playing) engine.pause();
+        else engine.play();
+      } else if (e.key === "Enter" && !meta) {
+        engine.stop();
+      } else if (e.key === "z" && meta && !e.shiftKey) {
         e.preventDefault();
         undo();
       } else if (
-        (e.key === "y" && (e.ctrlKey || e.metaKey)) ||
-        (e.key === "z" && (e.ctrlKey || e.metaKey) && e.shiftKey)
+        (e.key === "y" && meta) ||
+        (e.key === "z" && meta && e.shiftKey)
       ) {
         e.preventDefault();
         redo();
       } else if (e.key === "Home") {
         engine.seek(0);
+      } else if (e.key === "e" && meta) {
+        e.preventDefault();
+        setShowExportModal(true);
+      } else if (e.key === "/" && meta) {
+        e.preventDefault();
+        const cur = useProjectStore.getState().ui.showShortcuts;
+        setShowShortcuts(!cur);
+      } else if (e.key === "b" && meta) {
+        e.preventDefault();
+        setShowAssistant(true);
+      } else if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        !meta
+      ) {
+        const sid = useProjectStore.getState().project.selectedClipId;
+        if (sid) {
+          e.preventDefault();
+          removeClip(sid);
+          engine.rescheduleIfPlaying();
+        }
+      } else if ((e.key === "s" || e.key === "S") && !meta) {
+        const sid = useProjectStore.getState().project.selectedClipId;
+        if (sid) {
+          const pos = useProjectStore.getState().transport.position;
+          splitClip(sid, pos);
+          engine.rescheduleIfPlaying();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [playing, engine, undo, redo]);
-
-  const doExport = async () => {
-    setExportState(true, 0);
-    try {
-      const state = useProjectStore.getState();
-      const buf = await renderProject(state, (p) =>
-        useProjectStore.getState().setExportState(true, p),
-      );
-      const blob = encodeWav(buf);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${projectName || "project"}.wav`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } finally {
-      setExportState(false, 0);
-    }
-  };
+  }, [
+    playing,
+    engine,
+    undo,
+    redo,
+    setShowExportModal,
+    setShowShortcuts,
+    setShowAssistant,
+    removeClip,
+    splitClip,
+  ]);
 
   return (
     <div className="flex items-center gap-3 px-4 py-2 border-b border-edge bg-panel">
@@ -101,7 +130,7 @@ export function TransportBar({ engine }: Props) {
         <button
           className="px-3 py-1 bg-neutral-800 rounded hover:bg-neutral-700"
           onClick={() => engine.stop()}
-          title="Stop"
+          title="Stop (Enter)"
         >
           ⏹
         </button>
@@ -141,11 +170,25 @@ export function TransportBar({ engine }: Props) {
           Redo
         </button>
         <button
+          className="px-2 py-1 text-sm bg-neutral-800 rounded hover:bg-neutral-700"
+          onClick={() => setShowAssistant(true)}
+          title="Assistant (Ctrl+B)"
+        >
+          Assistant
+        </button>
+        <button
+          className="px-2 py-1 text-sm bg-neutral-800 rounded hover:bg-neutral-700"
+          onClick={() => setShowShortcuts(true)}
+          title="Shortcuts (Ctrl+/)"
+        >
+          ?
+        </button>
+        <button
           className="px-3 py-1 text-sm bg-emerald-600 rounded hover:bg-emerald-500 disabled:opacity-50"
-          onClick={doExport}
+          onClick={() => setShowExportModal(true)}
           disabled={exportInProgress}
         >
-          {exportInProgress ? "Rendering…" : "Export WAV"}
+          {exportInProgress ? "Rendering…" : "Export"}
         </button>
       </div>
     </div>
