@@ -1,15 +1,16 @@
+import { useState } from "react";
 import { useProjectStore } from "../store/projectStore";
-import type {
-  DelayEffect,
-  Effect,
-  Eq3Effect,
-  GainEffect,
-  PitchEffect,
-  ReverbEffect,
-  SpeedEffect,
-  Track,
-} from "../types";
 import type { AudioEngine } from "../audio/AudioEngine";
+import type { Effect, Track } from "../types";
+import { CHAIN_PRESETS } from "../audio/chainPresets";
+import {
+  loadUserChainPresets,
+  saveUserChainPresets,
+} from "../store/autosave";
+import { newId } from "../utils/id";
+import { EffectCard } from "./EffectCard";
+import { SpectrumAnalyzer } from "./SpectrumAnalyzer";
+import { MeterBar } from "./MeterBar";
 
 interface Props {
   engine: AudioEngine;
@@ -22,13 +23,15 @@ export function Inspector({ engine }: Props) {
   const clips = useProjectStore((s) => s.project.clips);
   const assets = useProjectStore((s) => s.assets);
   const updateClip = useProjectStore((s) => s.updateClip);
+  const setClipFade = useProjectStore((s) => s.setClipFade);
+  const toggleClipReverse = useProjectStore((s) => s.toggleClipReverse);
 
   const clip = clips.find((c) => c.id === selectedClipId) ?? null;
   const track =
     tracks.find((t) => t.id === (selectedTrackId ?? clip?.trackId)) ?? null;
 
   return (
-    <aside className="w-72 shrink-0 border-l border-edge bg-panel overflow-y-auto">
+    <aside className="w-full">
       <Section title="Clip">
         {clip ? (
           <div className="space-y-2 text-xs">
@@ -53,15 +56,51 @@ export function Inspector({ engine }: Props) {
                 onChange={(v) => updateClip(clip.id, { gainDb: v })}
               />
             </Row>
+            <Row label="Fade in">
+              <SliderWithValue
+                min={0}
+                max={Math.max(0.01, clip.duration / 2)}
+                step={0.01}
+                value={clip.fadeInSec}
+                suffix=" s"
+                onChange={(v) => setClipFade(clip.id, v, undefined)}
+              />
+            </Row>
+            <Row label="Fade out">
+              <SliderWithValue
+                min={0}
+                max={Math.max(0.01, clip.duration / 2)}
+                step={0.01}
+                value={clip.fadeOutSec}
+                suffix=" s"
+                onChange={(v) => setClipFade(clip.id, undefined, v)}
+              />
+            </Row>
+            <Row label="Reverse">
+              <button
+                className={
+                  "px-2 py-0.5 rounded border text-[11px] " +
+                  (clip.reversed
+                    ? "border-cyan-500 text-cyan-300 bg-cyan-950"
+                    : "border-edge text-neutral-300 bg-neutral-900")
+                }
+                onClick={() => {
+                  toggleClipReverse(clip.id);
+                  engine.rescheduleIfPlaying();
+                }}
+              >
+                {clip.reversed ? "Reversed" : "Normal"}
+              </button>
+            </Row>
           </div>
         ) : (
           <div className="text-xs text-neutral-500">No clip selected.</div>
         )}
       </Section>
 
-      <Section title="Track effects">
+      <Section title="Track">
         {track ? (
-          <TrackEffects engine={engine} track={track} />
+          <TrackSection engine={engine} track={track} />
         ) : (
           <div className="text-xs text-neutral-500">No track selected.</div>
         )}
@@ -130,317 +169,161 @@ function SliderWithValue({
   );
 }
 
-function TrackEffects({ engine, track }: { engine: AudioEngine; track: Track }) {
+function TrackSection({
+  engine,
+  track,
+}: {
+  engine: AudioEngine;
+  track: Track;
+}) {
   const updateEffect = useProjectStore((s) => s.updateEffect);
   const removeEffect = useProjectStore((s) => s.removeEffect);
   const moveEffect = useProjectStore((s) => s.moveEffect);
+  const setTrackEffects = useProjectStore((s) => s.setTrackEffects);
+  const toggleAbSlot = useProjectStore((s) => s.toggleAbSlot);
+  const copyAtoB = useProjectStore((s) => s.copyAtoB);
+  const applyChainPresetToTrack = useProjectStore(
+    (s) => s.applyChainPresetToTrack,
+  );
+
+  const [presetName, setPresetName] = useState("");
+  const [userPresets, setUserPresets] = useState(() => loadUserChainPresets());
 
   const patch = (effectId: string, p: Partial<Effect>) => {
     updateEffect(track.id, effectId, p);
     engine.rescheduleIfPlaying();
   };
 
-  if (track.effects.length === 0) {
-    return (
-      <div className="text-xs text-neutral-500">
-        No effects. Add one from the sidebar.
-      </div>
-    );
-  }
+  const trackAnalyzer = () => engine.getTrackAnalyzer(track.id);
 
   return (
-    <div className="space-y-2">
-      {track.effects.map((e, idx) => (
-        <div
-          key={e.id}
-          className="rounded border border-edge bg-neutral-900 p-2 text-xs"
-          draggable
-          onDragStart={(ev) => ev.dataTransfer.setData("text/plain", String(idx))}
-          onDragOver={(ev) => {
-            if (ev.dataTransfer.types.includes("text/plain")) ev.preventDefault();
+    <div className="space-y-3">
+      <div className="space-y-1">
+        <SpectrumAnalyzer getAnalyzer={trackAnalyzer} height={50} />
+        <MeterBar getAnalyzer={trackAnalyzer} height={14} showText={false} />
+      </div>
+
+      <div className="flex items-center gap-2 text-xs">
+        <div className="text-neutral-400">A/B</div>
+        <button
+          className={
+            "px-2 py-0.5 rounded border text-[11px] " +
+            (track.abSlot === "A"
+              ? "border-cyan-500 text-cyan-300 bg-cyan-950"
+              : "border-edge text-neutral-300 bg-neutral-900")
+          }
+          onClick={() => {
+            toggleAbSlot(track.id);
+            engine.rescheduleIfPlaying();
           }}
-          onDrop={(ev) => {
-            const from = Number(ev.dataTransfer.getData("text/plain"));
-            if (!isNaN(from) && from !== idx) moveEffect(track.id, from, idx);
+          title="Swap to alternative chain"
+        >
+          {track.abSlot}
+        </button>
+        <button
+          className="text-[11px] px-2 py-0.5 rounded border border-edge text-neutral-300 hover:bg-neutral-900"
+          onClick={() => copyAtoB(track.id)}
+          title="Copy current chain into the other slot"
+        >
+          Copy → other slot
+        </button>
+      </div>
+
+      <div className="flex items-center gap-2 text-xs">
+        <select
+          className="bg-neutral-900 border border-edge rounded px-2 py-1 text-[11px]"
+          defaultValue=""
+          onChange={(e) => {
+            const id = e.target.value;
+            if (!id) return;
+            applyChainPresetToTrack(track.id, id as never);
+            engine.rescheduleIfPlaying();
+            e.target.value = "";
           }}
         >
-          <div className="flex items-center gap-2">
-            <div className="font-medium uppercase tracking-wider text-[10px]">
-              {e.kind}
-            </div>
-            <label className="ml-auto flex items-center gap-1 text-[10px] text-neutral-400">
-              <input
-                type="checkbox"
-                checked={e.enabled}
-                onChange={(ev) => patch(e.id, { enabled: ev.target.checked })}
-              />
-              on
-            </label>
-            <button
-              className="text-[10px] text-neutral-500 hover:text-red-400"
-              onClick={() => removeEffect(track.id, e.id)}
-            >
-              ×
-            </button>
-          </div>
-          <EffectControls effect={e} onChange={(p) => patch(e.id, p)} />
+          <option value="">Quick chain…</option>
+          {CHAIN_PRESETS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* User presets save/load */}
+      <div className="flex items-center gap-1 text-[11px]">
+        <input
+          className="flex-1 bg-neutral-900 border border-edge rounded px-2 py-0.5"
+          placeholder="Preset name"
+          value={presetName}
+          onChange={(e) => setPresetName(e.target.value)}
+        />
+        <button
+          className="px-2 py-0.5 rounded border border-edge text-neutral-300 hover:bg-neutral-900"
+          onClick={() => {
+            const name = presetName.trim();
+            if (!name) return;
+            const next = [
+              ...userPresets.filter((p) => p.name !== name),
+              { name, effects: track.effects },
+            ];
+            saveUserChainPresets(next);
+            setUserPresets(next);
+            setPresetName("");
+          }}
+        >
+          Save
+        </button>
+        <select
+          className="bg-neutral-900 border border-edge rounded px-1 py-0.5 max-w-[100px]"
+          defaultValue=""
+          onChange={(e) => {
+            const name = e.target.value;
+            if (!name) return;
+            const preset = userPresets.find((p) => p.name === name);
+            if (!preset) return;
+            const fxArr = (preset.effects as Effect[]).map((fx) => ({
+              ...fx,
+              id: newId("fx"),
+            }));
+            setTrackEffects(track.id, fxArr);
+            engine.rescheduleIfPlaying();
+            e.target.value = "";
+          }}
+        >
+          <option value="">Load…</option>
+          {userPresets.map((p) => (
+            <option key={p.name} value={p.name}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {track.effects.length === 0 ? (
+        <div className="text-xs text-neutral-500">
+          No effects. Add one from the sidebar.
         </div>
-      ))}
+      ) : (
+        <div className="space-y-2">
+          {track.effects.map((e, idx) => (
+            <EffectCard
+              key={e.id}
+              effect={e}
+              index={idx}
+              onMove={(from, to) => {
+                moveEffect(track.id, from, to);
+                engine.rescheduleIfPlaying();
+              }}
+              onUpdate={(p) => patch(e.id, p)}
+              onRemove={() => {
+                removeEffect(track.id, e.id);
+                engine.rescheduleIfPlaying();
+              }}
+            />
+          ))}
+        </div>
+      )}
     </div>
-  );
-}
-
-function EffectControls({
-  effect,
-  onChange,
-}: {
-  effect: Effect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  switch (effect.kind) {
-    case "gain":
-      return <GainControls e={effect} onChange={onChange} />;
-    case "eq3":
-      return <Eq3Controls e={effect} onChange={onChange} />;
-    case "reverb":
-      return <ReverbControls e={effect} onChange={onChange} />;
-    case "delay":
-      return <DelayControls e={effect} onChange={onChange} />;
-    case "speed":
-      return <SpeedControls e={effect} onChange={onChange} />;
-    case "pitch":
-      return <PitchControls e={effect} onChange={onChange} />;
-  }
-}
-
-function SliderRow({
-  label,
-  min,
-  max,
-  step,
-  value,
-  suffix,
-  onChange,
-}: {
-  label: string;
-  min: number;
-  max: number;
-  step: number;
-  value: number;
-  suffix?: string;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <div className="grid grid-cols-[70px_1fr] items-center gap-2 mt-1">
-      <div className="text-neutral-400">{label}</div>
-      <SliderWithValue
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        suffix={suffix}
-        onChange={onChange}
-      />
-    </div>
-  );
-}
-
-function WetRow({
-  value,
-  onChange,
-}: {
-  value: number;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <SliderRow
-      label="Dry/Wet"
-      min={0}
-      max={1}
-      step={0.01}
-      value={value}
-      onChange={onChange}
-    />
-  );
-}
-
-function GainControls({
-  e,
-  onChange,
-}: {
-  e: GainEffect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  return (
-    <SliderRow
-      label="Gain"
-      min={-24}
-      max={12}
-      step={0.1}
-      value={e.gainDb}
-      suffix=" dB"
-      onChange={(v) => onChange({ gainDb: v } as Partial<Effect>)}
-    />
-  );
-}
-
-function Eq3Controls({
-  e,
-  onChange,
-}: {
-  e: Eq3Effect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  return (
-    <>
-      <SliderRow
-        label="Low"
-        min={-18}
-        max={18}
-        step={0.1}
-        value={e.lowGainDb}
-        suffix=" dB"
-        onChange={(v) => onChange({ lowGainDb: v } as Partial<Effect>)}
-      />
-      <SliderRow
-        label="Mid"
-        min={-18}
-        max={18}
-        step={0.1}
-        value={e.midGainDb}
-        suffix=" dB"
-        onChange={(v) => onChange({ midGainDb: v } as Partial<Effect>)}
-      />
-      <SliderRow
-        label="High"
-        min={-18}
-        max={18}
-        step={0.1}
-        value={e.highGainDb}
-        suffix=" dB"
-        onChange={(v) => onChange({ highGainDb: v } as Partial<Effect>)}
-      />
-      <SliderRow
-        label="Low f"
-        min={50}
-        max={800}
-        step={1}
-        value={e.lowFreq}
-        suffix=" Hz"
-        onChange={(v) => onChange({ lowFreq: v } as Partial<Effect>)}
-      />
-      <SliderRow
-        label="High f"
-        min={1500}
-        max={12000}
-        step={10}
-        value={e.highFreq}
-        suffix=" Hz"
-        onChange={(v) => onChange({ highFreq: v } as Partial<Effect>)}
-      />
-    </>
-  );
-}
-
-function ReverbControls({
-  e,
-  onChange,
-}: {
-  e: ReverbEffect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  return (
-    <>
-      <SliderRow
-        label="Decay"
-        min={0.2}
-        max={6}
-        step={0.1}
-        value={e.decaySec}
-        suffix=" s"
-        onChange={(v) => onChange({ decaySec: v } as Partial<Effect>)}
-      />
-      <SliderRow
-        label="Pre-delay"
-        min={0}
-        max={100}
-        step={1}
-        value={e.preDelayMs}
-        suffix=" ms"
-        onChange={(v) => onChange({ preDelayMs: v } as Partial<Effect>)}
-      />
-      <WetRow value={e.wet} onChange={(v) => onChange({ wet: v } as Partial<Effect>)} />
-    </>
-  );
-}
-
-function DelayControls({
-  e,
-  onChange,
-}: {
-  e: DelayEffect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  return (
-    <>
-      <SliderRow
-        label="Time"
-        min={0.01}
-        max={2}
-        step={0.01}
-        value={e.timeSec}
-        suffix=" s"
-        onChange={(v) => onChange({ timeSec: v } as Partial<Effect>)}
-      />
-      <SliderRow
-        label="Feedback"
-        min={0}
-        max={0.95}
-        step={0.01}
-        value={e.feedback}
-        onChange={(v) => onChange({ feedback: v } as Partial<Effect>)}
-      />
-      <WetRow value={e.wet} onChange={(v) => onChange({ wet: v } as Partial<Effect>)} />
-    </>
-  );
-}
-
-function SpeedControls({
-  e,
-  onChange,
-}: {
-  e: SpeedEffect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  return (
-    <SliderRow
-      label="Rate"
-      min={0.25}
-      max={4}
-      step={0.01}
-      value={e.rate}
-      suffix="×"
-      onChange={(v) => onChange({ rate: v } as Partial<Effect>)}
-    />
-  );
-}
-
-function PitchControls({
-  e,
-  onChange,
-}: {
-  e: PitchEffect;
-  onChange: (p: Partial<Effect>) => void;
-}) {
-  return (
-    <SliderRow
-      label="Semis"
-      min={-24}
-      max={24}
-      step={1}
-      value={e.semitones}
-      suffix=" st"
-      onChange={(v) => onChange({ semitones: v } as Partial<Effect>)}
-    />
   );
 }

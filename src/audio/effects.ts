@@ -1,4 +1,14 @@
-import type { Effect, Eq3Effect, ReverbEffect, DelayEffect } from "../types";
+import type {
+  CompressorEffect,
+  DelayEffect,
+  Effect,
+  Eq10Effect,
+  Eq3Effect,
+  LimiterEffect,
+  ReverbEffect,
+  SaturationEffect,
+  WidenerEffect,
+} from "../types";
 import { dbToGain } from "../utils/format";
 
 /** A compiled effect: nodes wired dry -> dry; wet -> wet; merged to output. */
@@ -108,6 +118,31 @@ function compileEq3(ctx: BaseAudioContext, e: Eq3Effect): CompiledEffect {
   };
 }
 
+/** Standard ISO 1/3-octave centers used as graphic 10-band EQ defaults. */
+export const EQ10_DEFAULT_FREQS = [
+  31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
+];
+
+function compileEq10(ctx: BaseAudioContext, e: Eq10Effect): CompiledEffect {
+  const filters = e.bands.map((b) => {
+    const f = ctx.createBiquadFilter();
+    f.type = b.type;
+    f.frequency.value = b.freq;
+    f.gain.value = b.enabled ? b.gainDb : 0;
+    f.Q.value = b.q;
+    return f;
+  });
+  for (let i = 0; i < filters.length - 1; i++) {
+    filters[i].connect(filters[i + 1]);
+  }
+  return {
+    input: filters[0],
+    output: filters[filters.length - 1],
+    rateMultiplier: 1,
+    dispose: () => filters.forEach((f) => f.disconnect()),
+  };
+}
+
 function compileReverb(ctx: BaseAudioContext, e: ReverbEffect): CompiledEffect {
   const { input, wetIn, wetOut, output } = createDryWet(ctx, e.wet);
   const conv = ctx.createConvolver();
@@ -153,6 +188,162 @@ function compileDelay(ctx: BaseAudioContext, e: DelayEffect): CompiledEffect {
   };
 }
 
+function compileCompressor(
+  ctx: BaseAudioContext,
+  e: CompressorEffect,
+): CompiledEffect {
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = e.thresholdDb;
+  comp.ratio.value = e.ratio;
+  comp.attack.value = e.attackMs / 1000;
+  comp.release.value = e.releaseMs / 1000;
+  comp.knee.value = e.kneeDb;
+  const makeup = ctx.createGain();
+  makeup.gain.value = dbToGain(e.makeupDb);
+  comp.connect(makeup);
+  return {
+    input: comp,
+    output: makeup,
+    rateMultiplier: 1,
+    dispose: () => {
+      comp.disconnect();
+      makeup.disconnect();
+    },
+  };
+}
+
+function compileLimiter(
+  ctx: BaseAudioContext,
+  e: LimiterEffect,
+): CompiledEffect {
+  // A limiter is a high-ratio compressor with fast attack hitting just below ceiling.
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = Math.min(0, e.ceilingDb);
+  comp.ratio.value = 20;
+  comp.attack.value = 0.001;
+  comp.release.value = e.releaseMs / 1000;
+  comp.knee.value = 0;
+  return {
+    input: comp,
+    output: comp,
+    rateMultiplier: 1,
+    dispose: () => comp.disconnect(),
+  };
+}
+
+function buildSaturationCurve(drive: number, mode: "soft" | "hard"): Float32Array {
+  // Map drive 0..1 to a useful gain range.
+  const k = 1 + drive * 30;
+  const n = 4096;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    let y: number;
+    if (mode === "hard") {
+      y = Math.max(-1, Math.min(1, x * k));
+    } else {
+      y = Math.tanh(x * k);
+    }
+    // Normalize so max output ~ 1 to keep perceived loudness balanced.
+    curve[i] = y / Math.tanh(k);
+  }
+  return curve;
+}
+
+function compileSaturation(
+  ctx: BaseAudioContext,
+  e: SaturationEffect,
+): CompiledEffect {
+  const { input, wetIn, wetOut, output } = createDryWet(ctx, e.wet);
+  const shaper = ctx.createWaveShaper();
+  shaper.curve = buildSaturationCurve(e.drive, e.mode);
+  shaper.oversample = "4x";
+  const tone = ctx.createBiquadFilter();
+  tone.type = "lowpass";
+  tone.frequency.value = e.toneHz;
+  tone.Q.value = 0.7;
+  wetIn.connect(shaper).connect(tone).connect(wetOut);
+  return {
+    input,
+    output,
+    rateMultiplier: 1,
+    dispose: () => {
+      input.disconnect();
+      shaper.disconnect();
+      tone.disconnect();
+      wetIn.disconnect();
+      wetOut.disconnect();
+      output.disconnect();
+    },
+  };
+}
+
+/**
+ * Stereo widener via M/S processing.
+ *   L = M + S, R = M - S, where M = (L+R)/2 and S = (L-R)/2.
+ * width=0 collapses to mono; width=1 unity; width=2 doubles the side.
+ */
+function compileWidener(
+  ctx: BaseAudioContext,
+  e: WidenerEffect,
+): CompiledEffect {
+  const splitter = ctx.createChannelSplitter(2);
+  const merger = ctx.createChannelMerger(2);
+
+  // M = 0.5 L + 0.5 R
+  const mGain = ctx.createGain();
+  mGain.gain.value = 0.5;
+  const mL = ctx.createGain();
+  mL.gain.value = 1;
+  const mR = ctx.createGain();
+  mR.gain.value = 1;
+  splitter.connect(mL, 0);
+  splitter.connect(mR, 1);
+  mL.connect(mGain);
+  mR.connect(mGain);
+
+  // S = 0.5 L - 0.5 R
+  const sGain = ctx.createGain();
+  sGain.gain.value = 0.5;
+  const sR = ctx.createGain();
+  sR.gain.value = -1;
+  splitter.connect(sGain, 0);
+  splitter.connect(sR, 1);
+  sR.connect(sGain);
+
+  // Apply width to S only.
+  const sScaled = ctx.createGain();
+  sScaled.gain.value = e.width;
+  sGain.connect(sScaled);
+
+  // L_out = M + S_scaled, R_out = M - S_scaled
+  const sNeg = ctx.createGain();
+  sNeg.gain.value = -1;
+  sScaled.connect(sNeg);
+
+  mGain.connect(merger, 0, 0);
+  sScaled.connect(merger, 0, 0);
+  mGain.connect(merger, 0, 1);
+  sNeg.connect(merger, 0, 1);
+
+  return {
+    input: splitter,
+    output: merger,
+    rateMultiplier: 1,
+    dispose: () => {
+      splitter.disconnect();
+      merger.disconnect();
+      mGain.disconnect();
+      mL.disconnect();
+      mR.disconnect();
+      sGain.disconnect();
+      sR.disconnect();
+      sScaled.disconnect();
+      sNeg.disconnect();
+    },
+  };
+}
+
 /** "Speed" and "pitch" in this prototype both just change source playbackRate. */
 function compilePassThrough(
   ctx: BaseAudioContext,
@@ -178,6 +369,8 @@ export function compileEffect(
       return compileGain(ctx, e.gainDb);
     case "eq3":
       return compileEq3(ctx, e);
+    case "eq10":
+      return compileEq10(ctx, e);
     case "reverb":
       return compileReverb(ctx, e);
     case "delay":
@@ -186,6 +379,14 @@ export function compileEffect(
       return compilePassThrough(ctx, e.rate);
     case "pitch":
       return compilePassThrough(ctx, Math.pow(2, e.semitones / 12));
+    case "compressor":
+      return compileCompressor(ctx, e);
+    case "limiter":
+      return compileLimiter(ctx, e);
+    case "saturation":
+      return compileSaturation(ctx, e);
+    case "widener":
+      return compileWidener(ctx, e);
   }
 }
 

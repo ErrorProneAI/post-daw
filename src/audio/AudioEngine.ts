@@ -1,4 +1,4 @@
-import type { AppState, Clip, ID, Track } from "../types";
+import type { AppState, AudioAsset, Clip, ID, Track } from "../types";
 import { buildEffectChain } from "./effects";
 import { dbToGain } from "../utils/format";
 
@@ -16,21 +16,23 @@ interface EngineHandlers {
 /**
  * Real-time audio engine.
  *
- * Playback strategy: when the user presses play, we walk the project state,
- * build an effect chain per track, and schedule BufferSource nodes for every
- * clip that intersects [playhead, +inf). Pause/stop tears down all sources.
- *
- * The engine also drives the visual playhead via requestAnimationFrame,
- * updating the store's `transport.position`.
+ * Topology (per play cycle):
+ *   clip -> clipGain (with fade automation) -> trackChain -> trackGain
+ *      -> trackPan -> trackAnalyzer -> masterChain -> masterGain
+ *      -> masterAnalyzer -> destination
  */
 export class AudioEngine {
   private ctx: AudioContext | null = null;
-  private master: GainNode | null = null;
+  private masterOut: GainNode | null = null;
+  private masterAnalyzer: AnalyserNode | null = null;
+  private trackAnalyzers = new Map<ID, AnalyserNode>();
   private sources: ScheduledSource[] = [];
   private rafId: number | null = null;
   private startCtxTime = 0;
   private startProjTime = 0;
   private handlers: EngineHandlers;
+  /** Reversed copies of buffers, keyed by asset.id. Built lazily. */
+  private reversedBuffers = new Map<ID, AudioBuffer>();
 
   constructor(handlers: EngineHandlers) {
     this.handlers = handlers;
@@ -39,8 +41,12 @@ export class AudioEngine {
   getContext(): AudioContext {
     if (!this.ctx) {
       this.ctx = new AudioContext();
-      this.master = this.ctx.createGain();
-      this.master.connect(this.ctx.destination);
+      this.masterOut = this.ctx.createGain();
+      this.masterAnalyzer = this.ctx.createAnalyser();
+      this.masterAnalyzer.fftSize = 2048;
+      this.masterAnalyzer.smoothingTimeConstant = 0.8;
+      this.masterOut.connect(this.masterAnalyzer);
+      this.masterAnalyzer.connect(this.ctx.destination);
     }
     return this.ctx;
   }
@@ -48,6 +54,17 @@ export class AudioEngine {
   async resume(): Promise<void> {
     const ctx = this.getContext();
     if (ctx.state === "suspended") await ctx.resume();
+  }
+
+  /** Master meter analyzer node (post-fader, pre-destination). */
+  getMasterAnalyzer(): AnalyserNode | null {
+    this.getContext();
+    return this.masterAnalyzer;
+  }
+
+  /** Per-track analyzer; returns null if track has no live chain right now. */
+  getTrackAnalyzer(trackId: ID): AnalyserNode | null {
+    return this.trackAnalyzers.get(trackId) ?? null;
   }
 
   getProjectDuration(): number {
@@ -109,18 +126,50 @@ export class AudioEngine {
     return !track.mute;
   }
 
+  private getReversedBuffer(asset: AudioAsset): AudioBuffer | null {
+    if (!asset.buffer) return null;
+    const cached = this.reversedBuffers.get(asset.id);
+    if (cached) return cached;
+    const ctx = this.getContext();
+    const src = asset.buffer;
+    const reversed = ctx.createBuffer(
+      src.numberOfChannels,
+      src.length,
+      src.sampleRate,
+    );
+    for (let ch = 0; ch < src.numberOfChannels; ch++) {
+      const inData = src.getChannelData(ch);
+      const outData = reversed.getChannelData(ch);
+      const n = inData.length;
+      for (let i = 0; i < n; i++) outData[i] = inData[n - 1 - i];
+    }
+    this.reversedBuffers.set(asset.id, reversed);
+    return reversed;
+  }
+
   private scheduleFrom(projectTime: number): void {
     const ctx = this.getContext();
-    if (!this.master) return;
+    if (!this.masterOut) return;
     const state = this.handlers.getState();
     const { project, assets } = state;
 
     const trackById = new Map<ID, Track>(project.tracks.map((t) => [t.id, t]));
 
+    // Build master chain once.
+    const masterChain = buildEffectChain(ctx, project.master.effects);
+    const masterGain = ctx.createGain();
+    masterGain.gain.value = dbToGain(project.master.volumeDb);
+    masterChain.output.connect(masterGain);
+    masterGain.connect(this.masterOut);
+
     // Build a chain per track so multiple clips share the same effect state.
+    this.trackAnalyzers.clear();
     const trackChains = new Map<
       ID,
-      ReturnType<typeof buildEffectChain> & { trackGain: GainNode }
+      ReturnType<typeof buildEffectChain> & {
+        trackGain: GainNode;
+        analyzer: AnalyserNode;
+      }
     >();
 
     for (const track of project.tracks) {
@@ -133,11 +182,17 @@ export class AudioEngine {
       const panner = ctx.createStereoPanner();
       panner.pan.value = track.pan;
 
+      const analyzer = ctx.createAnalyser();
+      analyzer.fftSize = 1024;
+      analyzer.smoothingTimeConstant = 0.7;
+
       chain.output.connect(trackGain);
       trackGain.connect(panner);
-      panner.connect(this.master);
+      panner.connect(analyzer);
+      analyzer.connect(masterChain.input);
 
-      trackChains.set(track.id, { ...chain, trackGain });
+      trackChains.set(track.id, { ...chain, trackGain, analyzer });
+      this.trackAnalyzers.set(track.id, analyzer);
     }
 
     for (const clip of project.clips) {
@@ -151,8 +206,12 @@ export class AudioEngine {
       const clipEnd = clip.start + clip.duration;
       if (clipEnd <= projectTime) continue;
 
+      const buffer = clip.reversed
+        ? this.getReversedBuffer(asset) ?? asset.buffer
+        : asset.buffer;
+
       const src = ctx.createBufferSource();
-      src.buffer = asset.buffer;
+      src.buffer = buffer;
       src.playbackRate.value = chain.rateMultiplier;
 
       const clipGain = ctx.createGain();
@@ -165,11 +224,53 @@ export class AudioEngine {
       const whenCtx =
         this.startCtxTime + (clipStartInProject - projectTime);
       const offsetInClip = clipStartInProject - clip.start;
-      const offsetInAsset = clip.offset + offsetInClip;
+
+      // Reversed clips read the asset from the tail end of the trim window.
+      const trimRightInAsset = clip.offset + clip.duration;
+      const offsetInAsset = clip.reversed
+        ? Math.max(0, asset.duration - trimRightInAsset + offsetInClip)
+        : clip.offset + offsetInClip;
+
       const playDuration = Math.max(
         0,
         clip.duration - offsetInClip,
       ) / chain.rateMultiplier;
+
+      // Fade in / out automation on clipGain.
+      const baseGain = dbToGain(clip.gainDb);
+      const fadeIn = Math.max(0, clip.fadeInSec);
+      const fadeOut = Math.max(0, clip.fadeOutSec);
+      try {
+        clipGain.gain.cancelScheduledValues(whenCtx);
+        if (fadeIn > 0 && offsetInClip < fadeIn) {
+          // Start at silence (or current point inside fade-in) and ramp up.
+          const startFrac = Math.max(
+            0.0001,
+            offsetInClip / fadeIn,
+          );
+          clipGain.gain.setValueAtTime(baseGain * startFrac, whenCtx);
+          clipGain.gain.linearRampToValueAtTime(
+            baseGain,
+            whenCtx + (fadeIn - offsetInClip) / chain.rateMultiplier,
+          );
+        } else {
+          clipGain.gain.setValueAtTime(baseGain, whenCtx);
+        }
+        if (fadeOut > 0) {
+          const fadeStartInClip = Math.max(0, clip.duration - fadeOut);
+          if (clip.duration - offsetInClip > 0) {
+            const fadeStartCtx =
+              whenCtx + Math.max(0, fadeStartInClip - offsetInClip) / chain.rateMultiplier;
+            clipGain.gain.setValueAtTime(baseGain, fadeStartCtx);
+            clipGain.gain.linearRampToValueAtTime(
+              0.0001,
+              whenCtx + playDuration,
+            );
+          }
+        }
+      } catch {
+        // Some browsers (or odd timings) may throw — fall through silently.
+      }
 
       try {
         src.start(whenCtx, offsetInAsset, playDuration);
@@ -196,7 +297,14 @@ export class AudioEngine {
       for (const chain of trackChains.values()) {
         chain.dispose();
       }
+      try {
+        masterChain.dispose();
+        masterGain.disconnect();
+      } catch {
+        // ignore
+      }
       trackChains.clear();
+      this.trackAnalyzers.clear();
       // restore to the original method for next play cycle
       this.stopAllSources = prevStop;
     };
@@ -262,6 +370,11 @@ export class AudioEngine {
     this.startCtxTime = ctx.currentTime + 0.05;
     this.startProjTime = Math.max(0, pos);
     this.scheduleFrom(this.startProjTime);
+  }
+
+  /** Drop cached reversed buffers (call when an asset is removed). */
+  invalidateReversedFor(assetId: ID): void {
+    this.reversedBuffers.delete(assetId);
   }
 
   /** Preview a single asset (used from Sidebar before dropping it on a track). */
